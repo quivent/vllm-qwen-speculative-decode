@@ -1,4 +1,4 @@
-# speculate-qwen
+# vllm-qwen-speculative-decode
 
 Speculative decoding optimization toolkit for vLLM + Qwen 3.5-27B MTP heads on NVIDIA GH200.
 
