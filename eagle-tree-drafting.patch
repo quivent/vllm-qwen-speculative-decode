@@ -1,0 +1,30 @@
+# eagle.py propose_tree() fix for MTP models
+#
+# Bug: propose_tree() unconditionally unpacks model output as a tuple
+# (last_hidden_states, hidden_states = self.model(...)) but MTP models
+# return a single tensor. This causes ValueError on any branching tree
+# config with MTP.
+#
+# Applied to: /home/ubuntu/.local/lib/python3.10/site-packages/vllm/v1/spec_decode/eagle.py
+# Line: ~1170
+#
+# Additionally: --attention-backend TREE_ATTN must be set at serve time
+# because propose_tree builds TreeAttentionMetadata which requires
+# TreeAttentionImpl in the attention layers. The default flash_attn
+# backend will reject this metadata type.
+
+--- a/vllm/v1/spec_decode/eagle.py
++++ b/vllm/v1/spec_decode/eagle.py
+@@ -1170,7 +1170,12 @@
+-                last_hidden_states, hidden_states = self.model(
++                ret = self.model(
+                     input_ids=self.input_ids[:num_input_tokens],
+                     positions=self.positions[:num_input_tokens],
+                     hidden_states=self.hidden_states[:num_input_tokens],
+                     inputs_embeds=None,
+                 )
++                if not self.model_returns_tuple():
++                    last_hidden_states = ret
++                    hidden_states = ret
++                else:
++                    last_hidden_states, hidden_states = ret
