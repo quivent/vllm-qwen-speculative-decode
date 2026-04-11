@@ -1,25 +1,46 @@
-# eagle.py propose_tree() fix for MTP models
-#
-# Bug: propose_tree() unconditionally unpacks model output as a tuple
-# (last_hidden_states, hidden_states = self.model(...)) but MTP models
-# return a single tensor. This causes ValueError on any branching tree
-# config with MTP.
+# eagle.py propose_tree() fixes for MTP + multimodal (M-RoPE) models
 #
 # Applied to: /home/ubuntu/.local/lib/python3.10/site-packages/vllm/v1/spec_decode/eagle.py
-# Line: ~1170
 #
-# Additionally: --attention-backend TREE_ATTN must be set at serve time
-# because propose_tree builds TreeAttentionMetadata which requires
-# TreeAttentionImpl in the attention layers. The default flash_attn
-# backend will reject this metadata type.
+# Bug 1 (line ~1068): self.positions.device crashes on M-RoPE models
+#   (Qwen3_5ForConditionalGeneration) because self.positions doesn't exist
+#   when uses_mrope=True. Fix: use the `positions` parameter instead.
+#
+# Bug 2 (line ~1153): self.positions[:num_tokens] = ... crashes same way.
+#   Fix: use self._set_positions() which handles mrope/xdrope/standard.
+#
+# Bug 3 (line ~1172): positions=self.positions[:num_input_tokens] crashes.
+#   Fix: use self._get_positions() which handles all three position types.
+#
+# Bug 4 (line ~1170): unconditional tuple unpack of model output breaks MTP.
+#   MTP returns single tensor, not (last_hidden, hidden) tuple.
+#   Fix: check self.model_returns_tuple() before unpacking.
 
 --- a/vllm/v1/spec_decode/eagle.py
 +++ b/vllm/v1/spec_decode/eagle.py
-@@ -1170,7 +1170,12 @@
+
+# Bug 1: device reference
+-        tree_positions = torch.empty(
+-            0, device=self.positions.device, dtype=self.positions.dtype
+-        )
++        tree_positions = torch.empty(
++            0, device=positions.device, dtype=positions.dtype
++        )
+
+# Bug 2: position buffer write
+-            self.positions[:num_tokens] = tree_positions.view(-1)
++            self._set_positions(num_tokens, tree_positions.view(-1))
+
+# Bug 3: position buffer read
+-                    positions=self.positions[:num_input_tokens],
++                    positions=self._get_positions(num_input_tokens),
+
+# Bug 4: model output unpacking
 -                last_hidden_states, hidden_states = self.model(
 +                ret = self.model(
                      input_ids=self.input_ids[:num_input_tokens],
-                     positions=self.positions[:num_input_tokens],
+-                    positions=self.positions[:num_input_tokens],
++                    positions=self._get_positions(num_input_tokens),
                      hidden_states=self.hidden_states[:num_input_tokens],
                      inputs_embeds=None,
                  )
