@@ -101,20 +101,28 @@ def _early_exit_forward(
 
     # Run layers 0..exit_layer-1 only
     end = min(exit_layer, model.end_layer)
-    for layer_idx, layer in enumerate(
-        islice(model.layers, model.start_layer, end),
-        start=model.start_layer,
-    ):
-        hidden_states, residual = layer(
-            positions=positions,
-            hidden_states=hidden_states,
-            residual=residual,
-        )
 
-    # Apply final RMSNorm — lm_head expects normalized hidden states.
-    # model.norm is GemmaRMSNorm (aliased as Qwen3_5RMSNorm).
-    # With residual: norm(hidden_states, residual) -> (normalized, residual)
-    hidden_states, _ = model.norm(hidden_states, residual)
+    # Detect transformers vs vLLM layer calling convention
+    _is_transformers = hasattr(model, 'rotary_emb') or not hasattr(model.layers[0].forward, '__wrapped__')
+
+    if _is_transformers and hasattr(model, 'rotary_emb'):
+        # Transformers path: layers expect (hidden_states, position_embeddings=...)
+        position_ids = positions.unsqueeze(0) if positions.dim() == 1 else positions
+        position_embeddings = model.rotary_emb(hidden_states, position_ids)
+        for layer in islice(model.layers, model.start_layer, end):
+            out = layer(hidden_states, position_embeddings=position_embeddings)
+            hidden_states = out[0] if isinstance(out, tuple) else out
+        hidden_states = model.norm(hidden_states)
+    else:
+        # vLLM path: layers expect (positions, hidden_states, residual)
+        for layer in islice(model.layers, model.start_layer, end):
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+        hidden_states, _ = model.norm(hidden_states, residual)
+
     return hidden_states
 
 
@@ -125,12 +133,15 @@ def _full_forward(
     intermediate_tensors=None,
     inputs_embeds: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run all layers — the standard forward path. Returns normalized hidden states."""
-    result = model(input_ids, positions, intermediate_tensors, inputs_embeds)
-    # model.forward returns hidden_states (or tuple with aux). Unpack if needed.
-    if isinstance(result, tuple):
-        return result[0]
-    return result
+    """Run all layers. Returns normalized hidden states ready for lm_head."""
+    # Just run _early_exit_forward with exit_layer = total layers
+    total = len(model.layers)
+    if not hasattr(model, 'start_layer'):
+        model.start_layer = 0
+    if not hasattr(model, 'end_layer'):
+        model.end_layer = total
+    return _early_exit_forward(model, input_ids, positions, total,
+                               intermediate_tensors, inputs_embeds)
 
 
 # ---------------------------------------------------------------------------
@@ -379,8 +390,19 @@ def benchmark_p_agree(
         Dict with p_agree, per-prompt details, timing.
     """
     el = exit_layer if exit_layer is not None else PLV_EXIT_LAYER
-    backbone = causal_lm_model.model
-    total_layers = backbone.end_layer - backbone.start_layer
+    # Support both vLLM and transformers model nesting
+    if hasattr(causal_lm_model, 'model') and hasattr(causal_lm_model.model, 'layers'):
+        backbone = causal_lm_model.model
+    elif hasattr(causal_lm_model, 'language_model'):
+        # Qwen3_5ForConditionalGeneration wraps the text model
+        backbone = causal_lm_model.language_model.model
+    else:
+        backbone = causal_lm_model.model
+    total_layers = len(backbone.layers)
+    if not hasattr(backbone, 'start_layer'):
+        backbone.start_layer = 0
+    if not hasattr(backbone, 'end_layer'):
+        backbone.end_layer = total_layers
 
     results = {
         "exit_layer": el,
@@ -409,7 +431,14 @@ def benchmark_p_agree(
                 h_partial = _early_exit_forward(
                     backbone, current_ids, positions, el,
                 )
-                logits_partial = causal_lm_model.compute_logits(h_partial)
+                if hasattr(causal_lm_model, 'compute_logits'):
+                    logits_partial = causal_lm_model.compute_logits(h_partial)
+                elif hasattr(causal_lm_model, 'lm_head'):
+                    logits_partial = causal_lm_model.lm_head(h_partial)
+                elif hasattr(causal_lm_model, 'language_model') and hasattr(causal_lm_model.language_model, 'lm_head'):
+                    logits_partial = causal_lm_model.language_model.lm_head(h_partial)
+                else:
+                    logits_partial = None
             torch.cuda.synchronize()
             t1 = time.perf_counter()
             results["partial_time_ms"] += (t1 - t0) * 1000
@@ -419,7 +448,14 @@ def benchmark_p_agree(
             t2 = time.perf_counter()
             with torch.no_grad():
                 h_full = _full_forward(backbone, current_ids, positions)
-                logits_full = causal_lm_model.compute_logits(h_full)
+                if hasattr(causal_lm_model, 'compute_logits'):
+                    logits_full = causal_lm_model.compute_logits(h_full)
+                elif hasattr(causal_lm_model, 'lm_head'):
+                    logits_full = causal_lm_model.lm_head(h_full)
+                elif hasattr(causal_lm_model, 'language_model') and hasattr(causal_lm_model.language_model, 'lm_head'):
+                    logits_full = causal_lm_model.language_model.lm_head(h_full)
+                else:
+                    logits_full = None
             torch.cuda.synchronize()
             t3 = time.perf_counter()
             results["full_time_ms"] += (t3 - t2) * 1000
@@ -512,22 +548,20 @@ def main():
     logger.info("Loading model from %s ...", args.model_path)
     logger.info("This uses vLLM's model loader. Requires --enforce-eager equivalent.\n")
 
-    # We load the model via vLLM's offline LLM interface for the benchmark.
-    # This handles GPTQ quantization, weight loading, etc.
-    from vllm import LLM
+    # Load model directly via transformers + auto-gptq for the benchmark.
+    # vLLM v1's LLMEngine runs in a subprocess and doesn't expose internals.
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    import torch
 
-    llm = LLM(
-        model=args.model_path,
-        enforce_eager=True,
-        gpu_memory_utilization=0.90,
-        max_model_len=2048,
+    logger.info("Loading model from %s (this may take a minute)...", args.model_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    causal_lm = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
         trust_remote_code=True,
     )
-
-    # Extract the actual model from vLLM's internals
-    model_runner = llm.llm_engine.model_executor.driver_worker.model_runner
-    causal_lm = model_runner.model
-    tokenizer = llm.get_tokenizer()
+    causal_lm.eval()
 
     exit_layers = [8, 16, 24, 32, 40, 48, 56] if args.sweep else [args.exit_layer]
 
