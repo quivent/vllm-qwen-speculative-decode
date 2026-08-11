@@ -1,10 +1,35 @@
-# vllm-qwen-speculative-decode
+<div align="center">
 
-Speculative decoding optimization toolkit for vLLM + Qwen 3.5-27B MTP heads on NVIDIA GH200.
+```text
+  _____      _____ _  _     ___ ___ ___ ___ 
+ / _ \ \    / / __| \| |   / __| _ \ __/ __|
+| (_) \ \/\/ /| _|| .` |   \__ \  _/ _| (__ 
+ \__\_\\_/\_/ |___|_|\_|   |___/_| |___\___|
+```
 
-Four independent strategies for increasing tokens/second, all composable:
+**Speculative decoding optimization toolkit for vLLM + Qwen 3.5-27B MTP heads on NVIDIA GH200.**
 
-## Strategies
+*Four independent strategies for increasing tokens/second, all composable.*
+
+![Python](https://img.shields.io/badge/Python-3.10+-blue?style=for-the-badge&logo=python)
+![CUDA](https://img.shields.io/badge/CUDA-Compatible-green?style=for-the-badge&logo=nvidia)
+![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=for-the-badge)
+
+</div>
+
+---
+
+## 📑 Table of Contents
+- [🎯 Strategies](#-strategies)
+- [⚡ Baseline Benchmarks](#-baseline)
+- [📂 Files Overview](#-files)
+- [📦 Requirements](#-requirements)
+- [⚠️ Known Issues](#-known-issues)
+- [📄 License](#-license)
+
+---
+
+## 🎯 Strategies
 
 ### 1. Adaptive MTP (`adaptive_mtp.py`)
 
@@ -63,9 +88,12 @@ python partial_layer_verify.py \
 
 Use top-K candidates from MTP head instead of argmax, verified in one batched forward pass with tree attention mask.
 
-**Status:** Blocked by vLLM 0.19 bug — `propose_tree()` assumes Eagle-style model, crashes on MTP with `AttributeError: 'EagleProposer' has no attribute 'positions'`. Patch in `eagle-tree-drafting.patch` fixes the tuple-unpack bug but the positions issue remains.
+> [!WARNING]
+> **Status:** Blocked by vLLM 0.19 bug — `propose_tree()` assumes Eagle-style model, crashes on MTP with `AttributeError: 'EagleProposer' has no attribute 'positions'`. Patch in `eagle-tree-drafting.patch` fixes the tuple-unpack bug but the positions issue remains.
 
-## Baseline
+---
+
+## ⚡ Baseline
 
 Measured on GH200 (96GB HBM3e, 900 GB/s), Qwen 3.5-27B W4A16, vLLM 0.19, MTP spec=7:
 
@@ -75,11 +103,13 @@ Measured on GH200 (96GB HBM3e, 900 GB/s), Qwen 3.5-27B W4A16, vLLM 0.19, MTP spe
 | Mixed (5-prompt suite) | 188 |
 | Prose / explanation | 130 |
 
-Content type is the dominant variable in MTP acceptance rate.
+*Content type is the dominant variable in MTP acceptance rate.*
 
-## Files
+---
 
-```
+## 📂 Files
+
+```text
 adaptive_mtp.py              # Strategy 1: adaptive chain length
 partial_layer_verify.py      # Strategy 3: partial-layer verification
 microgreens/
@@ -94,19 +124,25 @@ docs/
 eagle-tree-drafting.patch    # Fix for propose_tree() MTP tuple-unpack bug
 ```
 
-## Requirements
+---
+
+## 📦 Requirements
 
 - vLLM >= 0.19
 - Qwen 3.5-27B (bf16 checkpoint for MTP head cloning; W4A16 for serving)
 - NVIDIA GPU with >= 24GB VRAM (GH200 recommended)
 - PyTorch >= 2.1
 
-## Known Issues
+---
+
+## ⚠️ Known Issues
 
 - **GPTQ quantized models strip MTP weights.** Clone sibling heads from the bf16 checkpoint.
 - **vLLM 0.19 tree attention + MTP incompatible.** `propose_tree()` crashes on MTP models. Branching tree strategy blocked until upstream fix.
 - **Qwen 3.5 MTP asymmetric head_dim.** Queries use 512, keys/values use 256. All code in this repo accounts for this.
 
-## License
+---
+
+## 📄 License
 
 Apache-2.0
